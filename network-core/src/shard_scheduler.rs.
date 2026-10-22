@@ -1,0 +1,526 @@
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::shard::{
+    ShardDescriptor,
+    ShardId,
+    ShardKind,
+    ShardState,
+    ShardTrustState,
+};
+
+/// Maximum number of candidates returned by one scheduling request.
+pub const DEFAULT_MAX_SCHEDULING_CANDIDATES: usize = 100;
+
+/// Default maximum acceptable scheduling workload score.
+pub const DEFAULT_MAX_WORKLOAD_SCORE: u8 = 90;
+
+/// Scheduler errors.
+#[derive(Debug, Error)]
+pub enum ShardSchedulerError {
+    #[error("Scheduling request has no eligible shard candidates")]
+    NoEligibleCandidates,
+
+    #[error("Invalid scheduling request: {0}")]
+    InvalidRequest(String),
+
+    #[error("System clock returned an invalid timestamp")]
+    ClockError,
+}
+
+/// Result type used by the scheduler.
+pub type ShardSchedulerResult<T> = Result<T, ShardSchedulerError>;
+
+/// Scheduling priority.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulingPriority {
+    Background,
+    Normal,
+    High,
+    Critical,
+}
+
+/// Describes the type of work that needs a shard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardWorkRequest {
+    pub request_id: String,
+    pub required_kind: ShardKind,
+    pub priority: SchedulingPriority,
+    pub estimated_cpu_percent: u8,
+    pub estimated_memory_mb: u64,
+    pub estimated_bandwidth_kbps: u64,
+    pub requires_verified_trust: bool,
+    pub preferred_region: Option<String>,
+    pub excluded_shards: Vec<ShardId>,
+    pub created_at_unix_ms: u64,
+}
+
+impl ShardWorkRequest {
+    /// Create a scheduling request with conservative defaults.
+    pub fn new(
+        request_id: impl Into<String>,
+        required_kind: ShardKind,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            required_kind,
+            priority: SchedulingPriority::Normal,
+            estimated_cpu_percent: 5,
+            estimated_memory_mb: 32,
+            estimated_bandwidth_kbps: 0,
+            requires_verified_trust: true,
+            preferred_region: None,
+            excluded_shards: Vec::new(),
+            created_at_unix_ms: current_time_ms().unwrap_or(0),
+        }
+    }
+
+    /// Validate basic request constraints.
+    pub fn validate(&self) -> ShardSchedulerResult<()> {
+        if self.request_id.trim().is_empty() {
+            return Err(ShardSchedulerError::InvalidRequest(
+                "request_id cannot be empty".to_string(),
+            ));
+        }
+
+        if self.estimated_cpu_percent > 100 {
+            return Err(ShardSchedulerError::InvalidRequest(
+                "estimated_cpu_percent must be between 0 and 100"
+                    .to_string(),
+            ));
+        }
+
+        if self.estimated_memory_mb == 0 {
+            return Err(ShardSchedulerError::InvalidRequest(
+                "estimated_memory_mb must be greater than zero"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Scheduler-reported resource availability for a shard.
+///
+/// These values must eventually come from a trusted resource monitor.
+/// Missing resource telemetry must not be interpreted as unlimited capacity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardResourceSnapshot {
+    pub shard_id: ShardId,
+    pub available_cpu_percent: u8,
+    pub available_memory_mb: u64,
+    pub available_bandwidth_kbps: u64,
+    pub workload_score: u8,
+    pub online: bool,
+    pub last_updated_unix_ms: u64,
+}
+
+impl ShardResourceSnapshot {
+    /// Check whether a snapshot is recent enough to use.
+    pub fn is_fresh(
+        &self,
+        now_unix_ms: u64,
+        maximum_age_ms: u64,
+    ) -> bool {
+        now_unix_ms.saturating_sub(self.last_updated_unix_ms)
+            <= maximum_age_ms
+    }
+
+    /// Check whether the snapshot can satisfy a request.
+    pub fn can_satisfy(
+        &self,
+        request: &ShardWorkRequest,
+        maximum_workload_score: u8,
+    ) -> bool {
+        self.online
+            && self.workload_score <= maximum_workload_score
+            && self.available_cpu_percent
+                >= request.estimated_cpu_percent
+            && self.available_memory_mb
+                >= request.estimated_memory_mb
+            && self.available_bandwidth_kbps
+                >= request.estimated_bandwidth_kbps
+    }
+}
+
+/// A candidate's scheduling score and eligibility explanation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardSchedulingCandidate {
+    pub shard_id: ShardId,
+    pub score: i64,
+    pub eligible: bool,
+    pub rejection_reasons: Vec<String>,
+}
+
+/// The scheduler's decision for one work request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardSchedulingDecision {
+    pub request_id: String,
+    pub selected_shard: ShardId,
+    pub selected_score: i64,
+    pub candidates_considered: usize,
+    pub decided_at_unix_ms: u64,
+}
+
+/// Scheduler configuration.
+#[derive(Debug, Clone)]
+pub struct ShardSchedulerConfig {
+    pub max_candidates: usize,
+    pub maximum_workload_score: u8,
+    pub maximum_snapshot_age_ms: u64,
+    pub prefer_lower_workload: bool,
+    pub region_match_bonus: i64,
+    pub priority_bonus: i64,
+}
+
+impl Default for ShardSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            max_candidates: DEFAULT_MAX_SCHEDULING_CANDIDATES,
+            maximum_workload_score: DEFAULT_MAX_WORKLOAD_SCORE,
+            maximum_snapshot_age_ms: 30_000,
+            prefer_lower_workload: true,
+            region_match_bonus: 20,
+            priority_bonus: 10,
+        }
+    }
+}
+
+/// Selects eligible shards for incoming work.
+///
+/// This scheduler ranks candidates only. It does not execute shard work,
+/// reserve resources, open network connections, or guarantee delivery.
+pub struct ShardScheduler {
+    config: ShardSchedulerConfig,
+    snapshots: HashMap<ShardId, ShardResourceSnapshot>,
+}
+
+impl ShardScheduler {
+    /// Create a scheduler with default settings.
+    pub fn new() -> Self {
+        Self::with_config(ShardSchedulerConfig::default())
+    }
+
+    /// Create a scheduler with custom settings.
+    pub fn with_config(config: ShardSchedulerConfig) -> Self {
+        Self {
+            config,
+            snapshots: HashMap::new(),
+        }
+    }
+
+    /// Return scheduler configuration.
+    pub fn config(&self) -> &ShardSchedulerConfig {
+        &self.config
+    }
+
+    /// Add or replace a resource snapshot.
+    pub fn update_snapshot(
+        &mut self,
+        snapshot: ShardResourceSnapshot,
+    ) {
+        self.snapshots.insert(snapshot.shard_id.clone(), snapshot);
+    }
+
+    /// Remove resource telemetry for a shard.
+    pub fn remove_snapshot(
+        &mut self,
+        shard_id: &ShardId,
+    ) -> Option<ShardResourceSnapshot> {
+        self.snapshots.remove(shard_id)
+    }
+
+    /// Retrieve a shard's latest resource snapshot.
+    pub fn get_snapshot(
+        &self,
+        shard_id: &ShardId,
+    ) -> Option<&ShardResourceSnapshot> {
+        self.snapshots.get(shard_id)
+    }
+
+    /// Return the number of resource snapshots held.
+    pub fn snapshot_count(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    /// Evaluate a single shard against a work request.
+    pub fn evaluate_candidate(
+        &self,
+        request: &ShardWorkRequest,
+        descriptor: &ShardDescriptor,
+        now_unix_ms: u64,
+    ) -> ShardSchedulingCandidate {
+        let mut reasons = Vec::new();
+
+        if descriptor.kind != request.required_kind {
+            reasons.push("Shard kind does not match request".to_string());
+        }
+
+        if descriptor.state != ShardState::Running {
+            reasons.push("Shard is not running".to_string());
+        }
+
+        if descriptor.trust_state == ShardTrustState::Revoked {
+            reasons.push("Shard trust has been revoked".to_string());
+        }
+
+        if request.requires_verified_trust
+            && descriptor.trust_state != ShardTrustState::Verified
+        {
+            reasons.push("Verified trust is required".to_string());
+        }
+
+        if request.excluded_shards.contains(&descriptor.id) {
+            reasons.push("Shard is explicitly excluded".to_string());
+        }
+
+        let snapshot = self.snapshots.get(&descriptor.id);
+
+        let mut score = 0_i64;
+
+        match snapshot {
+            None => {
+                reasons.push(
+                    "No resource telemetry is available".to_string(),
+                );
+            }
+            Some(snapshot) => {
+                if !snapshot.is_fresh(
+                    now_unix_ms,
+                    self.config.maximum_snapshot_age_ms,
+                ) {
+                    reasons.push(
+                        "Resource telemetry is stale".to_string(),
+                    );
+                }
+
+                if !snapshot.can_satisfy(
+                    request,
+                    self.config.maximum_workload_score,
+                ) {
+                    reasons.push(
+                        "Shard cannot satisfy resource requirements"
+                            .to_string(),
+                    );
+                }
+
+                if self.config.prefer_lower_workload {
+                    score +=
+                        (100_i64 - snapshot.workload_score.min(100) as i64)
+                            / 2;
+                }
+
+                score +=
+                    snapshot.available_cpu_percent.min(100) as i64 / 5;
+
+                score +=
+                    (snapshot.available_memory_mb.min(1_000_000) / 100)
+                        as i64;
+
+                score +=
+                    (snapshot.available_bandwidth_kbps.min(1_000_000)
+                        / 1000) as i64;
+            }
+        }
+
+        if let Some(preferred_region) = &request.preferred_region {
+            if descriptor
+                .assignment
+                .as_ref()
+                .map(|assignment| {
+                    assignment.region.eq_ignore_ascii_case(
+                        preferred_region,
+                    )
+                })
+                .unwrap_or(false)
+            {
+                score += self.config.region_match_bonus;
+            }
+        }
+
+        score += match request.priority {
+            SchedulingPriority::Background => 0,
+            SchedulingPriority::Normal => self.config.priority_bonus,
+            SchedulingPriority::High => self.config.priority_bonus * 2,
+            SchedulingPriority::Critical => self.config.priority_bonus * 3,
+        };
+
+        ShardSchedulingCandidate {
+            shard_id: descriptor.id.clone(),
+            score,
+            eligible: reasons.is_empty(),
+            rejection_reasons: reasons,
+        }
+    }
+
+    /// Rank eligible candidates for a work request.
+    pub fn rank_candidates(
+        &self,
+        request: &ShardWorkRequest,
+        descriptors: &[ShardDescriptor],
+        now_unix_ms: u64,
+    ) -> ShardSchedulerResult<Vec<ShardSchedulingCandidate>> {
+        request.validate()?;
+
+        let mut candidates: Vec<ShardSchedulingCandidate> = descriptors
+            .iter()
+            .map(|descriptor| {
+                self.evaluate_candidate(
+                    request,
+                    descriptor,
+                    now_unix_ms,
+                )
+            })
+            .filter(|candidate| candidate.eligible)
+            .collect();
+
+        candidates.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.shard_id.cmp(&b.shard_id))
+        });
+
+        candidates.truncate(self.config.max_candidates);
+
+        if candidates.is_empty() {
+            return Err(ShardSchedulerError::NoEligibleCandidates);
+        }
+
+        Ok(candidates)
+    }
+
+    /// Select the highest-ranked eligible shard.
+    pub fn schedule(
+        &self,
+        request: &ShardWorkRequest,
+        descriptors: &[ShardDescriptor],
+        now_unix_ms: u64,
+    ) -> ShardSchedulerResult<ShardSchedulingDecision> {
+        let candidates = self.rank_candidates(
+            request,
+            descriptors,
+            now_unix_ms,
+        )?;
+
+        let selected = candidates
+            .first()
+            .ok_or(ShardSchedulerError::NoEligibleCandidates)?;
+
+        Ok(ShardSchedulingDecision {
+            request_id: request.request_id.clone(),
+            selected_shard: selected.shard_id.clone(),
+            selected_score: selected.score,
+            candidates_considered: candidates.len(),
+            decided_at_unix_ms: now_unix_ms,
+        })
+    }
+}
+
+impl Default for ShardScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn current_time_ms() -> ShardSchedulerResult<u64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ShardSchedulerError::ClockError)?;
+
+    Ok(elapsed.as_millis().min(u64::MAX as u128) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_rejects_empty_id() {
+        let request = ShardWorkRequest::new(
+            "",
+            ShardKind::TrafficRelay,
+        );
+
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn request_rejects_cpu_above_one_hundred() {
+        let mut request = ShardWorkRequest::new(
+            "work-1",
+            ShardKind::TrafficRelay,
+        );
+
+        request.estimated_cpu_percent = 101;
+
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn stale_snapshot_is_not_fresh() {
+        let snapshot = ShardResourceSnapshot {
+            shard_id: ShardId::new(),
+            available_cpu_percent: 50,
+            available_memory_mb: 512,
+            available_bandwidth_kbps: 10_000,
+            workload_score: 10,
+            online: true,
+            last_updated_unix_ms: 1_000,
+        };
+
+        assert!(!snapshot.is_fresh(50_000, 30_000));
+    }
+
+    #[test]
+    fn fresh_snapshot_can_be_used() {
+        let snapshot = ShardResourceSnapshot {
+            shard_id: ShardId::new(),
+            available_cpu_percent: 50,
+            available_memory_mb: 512,
+            available_bandwidth_kbps: 10_000,
+            workload_score: 10,
+            online: true,
+            last_updated_unix_ms: 10_000,
+        };
+
+        assert!(snapshot.is_fresh(15_000, 30_000));
+    }
+
+    #[test]
+    fn resource_snapshot_rejects_insufficient_memory() {
+        let snapshot = ShardResourceSnapshot {
+            shard_id: ShardId::new(),
+            available_cpu_percent: 80,
+            available_memory_mb: 16,
+            available_bandwidth_kbps: 10_000,
+            workload_score: 10,
+            online: true,
+            last_updated_unix_ms: 10_000,
+        };
+
+        let request = ShardWorkRequest {
+            estimated_memory_mb: 128,
+            ..ShardWorkRequest::new(
+                "work-2",
+                ShardKind::TrafficRelay,
+            )
+        };
+
+        assert!(!snapshot.can_satisfy(&request, 90));
+    }
+}
