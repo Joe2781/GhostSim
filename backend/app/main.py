@@ -79,6 +79,7 @@ else None
 Register the device management API.
 
 app.include_router(devices_router)
+app.include_router(auth_router)
 
 if settings.cors_origins:
 app.add_middleware(
