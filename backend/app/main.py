@@ -16,6 +16,7 @@ check_database_connection,
 close_database_connections,
 )
 from app.api.devices import router as devices_router
+from app.api.auth import router as auth_router
 
 settings = get_settings()
 
