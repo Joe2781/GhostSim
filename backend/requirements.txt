@@ -1,17 +1,23 @@
-# GhostSim Backend — Python dependencies
+# GhostSim Backend — Production Dependencies
 
-# Web API
+# API framework and server
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.34,<1.0
 
-# Configuration and validation
+# Configuration and request validation
 pydantic>=2.10,<3.0
 pydantic-settings>=2.7,<3.0
 
-# PostgreSQL database access
+# Database and migrations
 SQLAlchemy[asyncio]>=2.0.36,<3.0
 asyncpg>=0.30,<1.0
 alembic>=1.14,<2.0
 
-# HTTP client for trusted service-to-service requests
+# HTTP client
 httpx>=0.28,<1.0
+
+# Trusted Firebase Authentication token verification
+firebase-admin>=6.6,<8.0
+
+# Device identity and cryptographic signature verification
+cryptography>=44.0,<46.0
